@@ -1,7 +1,6 @@
 package main
 
 import (
-	// "errors"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"log"
@@ -20,10 +19,8 @@ func main() {
 
 	// first argument is the name of the local command
 	local_command := arg_list[0]
-	// select the key to connect to the right server
-	fmt.Println("Local command invoked: ", local_command)
 
-	// check for string that matches a server name
+	// select the key to connect to the right server
 	if strings.Contains(local_command, "mcpi") {
 		host_cmd = "mcpi"
 	}
@@ -35,7 +32,7 @@ func main() {
 	privateKeyPath := "/home/ktoks/.ssh/id_ed25519"
 	key, err := os.ReadFile(privateKeyPath)
 	if err != nil {
-		log.Fatalf("Unable to read private key: %v", err)
+		log.Fatalf("Unable to open private key: %v", err)
 	}
 
 	// parse private key
@@ -54,11 +51,10 @@ func main() {
 	}
 
 	addr := host_cmd + ":22"
-	fmt.Println("host:port: ", addr)
 
 	client, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
-		log.Fatalf("unable to connect: %v", err)
+		log.Fatalf("Unable to connect: %v", err)
 	}
 	defer client.Close()
 
@@ -67,14 +63,14 @@ func main() {
 
 	session, err := client.NewSession()
 	if err != nil {
-		log.Fatalf("unable to create session: %v", err)
+		log.Fatalf("Unable to create session: %v", err)
 	}
 	defer session.Close()
 
-	fmt.Println("remote cmd: ", remote_cmd_str)
 	output, err := session.CombinedOutput(remote_cmd_str)
 	if err != nil {
 		log.Fatalf("Command failed: %v", err)
 	}
+
 	fmt.Printf("\n%s\n", output)
 }
