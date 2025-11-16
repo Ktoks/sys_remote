@@ -58,6 +58,8 @@ func main() {
 			}
 		}
 	}
+	// all remote arguments including the remote command
+	remote_cmd_str := strings.Join(arg_list[1:], " ")
 
 	if fileErr != nil || dialErr != nil {
 		signer := getSigner(privateKeyPath)
@@ -77,30 +79,28 @@ func main() {
 		}
 		defer session.Close()
 
-		// all remote arguments including the remote command
-		remote_cmd_str := strings.Join(arg_list[1:], " ")
-
 		output, err := session.CombinedOutput(remote_cmd_str)
 		if err != nil {
 			log.Fatalf("Command failed: %v", err)
 		}
 		fmt.Printf("\n%s\n", output)
 
-		// connect socket???
 		address := net.UnixAddr{
 			Name: socketPath,
 			Net:  "unix",
 		}
 
+		// start socket
 		unixListener, err := net.ListenUnix("unix", &address)
 		if err != nil {
 			log.Fatalf("Failed to create new Unix Socket: %v", err)
 		}
 		defer unixListener.Close()
+		unixListener.SetUnlinkOnClose(true)
 
 		fmt.Printf("\nNew Unix connection made: %s\n", unixListener.Addr())
 		// check the connection -
-		time.Sleep(10 * time.Second)
+		// time.Sleep(10 * time.Second)
 		//connect:
 		connection, err = net.Dial("unix", socketPath)
 		if err != nil {
@@ -125,22 +125,24 @@ func main() {
 				log.Printf("Error accepting connection: %v", err)
 				continue
 			}
-			go handleConnection(conn)
+			go handleConnection(conn, remote_cmd_str, client)
 		}
 	}
 
-	toprint := connection.LocalAddr().String()
-	fmt.Printf("unix connection made:\n%s\n", toprint)
+	fmt.Printf("Writing remote command...")
+	_, err := connection.Write([]byte(remote_cmd_str))
+	if err != nil {
+		log.Fatalf("Write failed: %v", err)
+	}
 
-	// fmt.Println("SSH master channel appears up.")
-	// fmt.Printf("\n%s\n", output)
-	// select {
-	// case <-ctx.Done():
-	// 	fmt.Println("SSH master channel check timed out.")
-	// case err := <-checkMasterChannel(client):
-	// 	if err != nil {
-	// 		fmt.Printf("SSH master channel appears down: %v\n", err)
-	// 	} else {
+	err = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err != nil {
+		log.Fatalf("Set read deadline failed: %v", err)
+	}
+	_, err = connection.Read([]byte(remote_cmd_str))
+	if err != nil {
+		log.Fatalf("Read failed: %v", err)
+	}
 
 	// 		session, err := client.NewSession()
 	// 		if err != nil {
@@ -159,25 +161,43 @@ func main() {
 	// config := getConfig(user.name, signer)
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, remote_cmd_str string, client *ssh.Client) {
 	defer conn.Close()
 
-	fmt.Printf("Accepted connection from: %s\n", conn.RemoteAddr())
+	fmt.Printf("Waiting for connection on: %v\n", conn.RemoteAddr())
 
 	buffer := make([]byte, 1024)
 	for {
 		// Read data from the client
+
+		// err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// if err != nil {
+		// 	log.Fatalf("Failed to set read deadline: %v", err)
+		// 	break
+		// }
+
 		n, err := conn.Read(buffer)
-		if err != nil {
+		// fmt.Println("connection read...")
+		if os.IsTimeout(err) {
+			fmt.Println("Timed out, disconnecting")
+			break
+		} else if err != nil {
 			log.Printf("Error reading from connection: %v", err)
-			return
 		}
 
 		receivedData := buffer[:n]
 		fmt.Printf("Received: %s\n", string(receivedData))
+		session, err := client.NewSession()
+		if err != nil {
+			log.Fatalf("New session failed: %v", err)
+		}
+		output, err := session.CombinedOutput(remote_cmd_str)
+		if err != nil {
+			log.Fatalf("Remote command failed: %v", err)
+		}
 
 		// Echo the data back to the client
-		_, err = conn.Write(receivedData)
+		_, err = conn.Write(output)
 		if err != nil {
 			log.Printf("Error writing to connection: %v", err)
 			return
@@ -217,26 +237,3 @@ func getSigner(privateKeyPath string) ssh.Signer {
 	}
 	return signer
 }
-
-// func checkMasterChannel(client *ssh.Client) chan error {
-// 	errChan := make(chan error, 1)
-// 	go func() {
-// 		// Attempt to create a new session or send a simple command
-// 		// This will fail if the underlying connection (master channel) is down
-// 		session, err := client.NewSession()
-// 		if err != nil {
-// 			errChan <- fmt.Errorf("failed to create SSH session: %w", err)
-// 			return
-// 		}
-// 		defer session.Close()
-
-// 		// Execute a simple command to verify connectivity
-// 		_, err = session.CombinedOutput("echo hello")
-// 		if err != nil {
-// 			errChan <- fmt.Errorf("failed to execute command on SSH session: %w", err)
-// 			return
-// 		}
-// 		errChan <- nil // No error, master channel appears up
-// 	}()
-// 	return errChan
-// }
