@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"encoding/gob"
+	"encoding/binary" // <--- NEW: For fast binary I/O
 	"flag"
 	"fmt"
 	"io"
@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic" // <--- NEW: Required for thread-safe counters
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,7 +29,14 @@ const (
 	IdleTimeout = 5 * time.Minute
 )
 
-// OutputPacket defines the protocol between Master and Client
+// Protocol Constants (Packet Types)
+const (
+	TypeStdout = 0x01
+	TypeStderr = 0x02
+	TypeExit   = 0x03
+)
+
+// OutputPacket defines the internal structure (not sent over wire directly anymore)
 type OutputPacket struct {
 	IsStderr bool
 	IsExit   bool
@@ -37,20 +44,54 @@ type OutputPacket struct {
 	Data     []byte
 }
 
-// Thread-safe encoder to prevent race conditions between Stdout and Stderr
+// SafeEncoder: Replaces Gob with manual binary writing
+// It ensures that multiple threads writing to the socket don't interleave their bytes.
 type SafeEncoder struct {
-	mu  sync.Mutex
-	enc *gob.Encoder
+	mu     sync.Mutex
+	writer io.Writer
 }
 
 func (s *SafeEncoder) Encode(pkt OutputPacket) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.enc.Encode(pkt)
+
+	// 1. Determine Type and Payload
+	var pType uint8
+	var payload []byte
+
+	if pkt.IsExit {
+		pType = TypeExit
+		// Convert ExitCode (int) to 4 bytes
+		payload = make([]byte, 4)
+		binary.BigEndian.PutUint32(payload, uint32(pkt.ExitCode))
+	} else if pkt.IsStderr {
+		pType = TypeStderr
+		payload = pkt.Data
+	} else {
+		pType = TypeStdout
+		payload = pkt.Data
+	}
+
+	// 2. Write Header [Type (1) + Length (4)]
+	header := make([]byte, 5)
+	header[0] = pType
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+
+	if _, err := s.writer.Write(header); err != nil {
+		return err
+	}
+
+	// 3. Write Payload
+	if len(payload) > 0 {
+		if _, err := s.writer.Write(payload); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Flags
-// We use a string flag. If empty, we are client. If set, we are daemon for that specific identity.
 var daemonIdentity = flag.String("daemon", "", "Internal use: run as daemon for specific link identity")
 var batchMode = flag.Bool("batch", false, "Run in batch mode (reads commands from stdin)")
 
@@ -79,36 +120,13 @@ func main() {
 	}
 	defer conn.Close()
 
-	// // --- NEW: BATCH MODE ---
-	// // Usage: echo "ls -la" | ./localhost --batch
-	// if len(os.Args) > 1 && os.Args[1] == "--batch" {
-	// 	runBatchMode(conn)
-	// 	return
-	// }
-	// // -----------------------
-
-	// // Standard Single Command Mode
-	// args := os.Args[1:]
-	// if len(args) == 0 {
-	// 	log.Fatal("Usage: <symlink> <cmd> OR <symlink> --batch")
-	// }
-	// remoteCmd := strings.Join(args, " ")
-
-	// if err := sendCommand(conn, remoteCmd); err != nil {
-	// 	log.Fatal(err)
-	// }
 	// A. BATCH MODE (High Performance)
-	// --------------------------------
-	// Triggered by the newly defined flag
 	if *batchMode {
 		runBatchMode(conn)
 		return
 	}
 
 	// B. STANDARD MODE (Single Command)
-	// ---------------------------------
-	// We use flag.Args() which contains everything AFTER the flags.
-	// e.g. "./localhost ls -la" -> flag.Args() is ["ls", "-la"]
 	args := flag.Args()
 	if len(args) == 0 {
 		fmt.Printf("Usage: %s <command> OR %s --batch\n", linkName, linkName)
@@ -122,7 +140,8 @@ func main() {
 	}
 }
 
-// NEW FUNCTION: Handles persistent connection for multiple commands
+// --- CLIENT LOGIC ---
+
 func runBatchMode(conn net.Conn) {
 	// 1. Sender Routine (Async)
 	go func() {
@@ -132,55 +151,86 @@ func runBatchMode(conn net.Conn) {
 			if strings.TrimSpace(cmd) == "" {
 				continue
 			}
-
 			// Write command to socket
 			_, err := fmt.Fprintf(conn, "%s\n", cmd)
 			if err != nil {
 				return
 			}
 		}
-
-		// --- CRITICAL FIX: Signal EOF to Master ---
-		// We close the *Write* end of the connection.
-		// This tells Master: "No more commands coming," but keeps the *Read* end open
-		// so we can still receive the results of the commands currently running.
+		// Close write end to signal EOF
 		if unixConn, ok := conn.(*net.UnixConn); ok {
 			unixConn.CloseWrite()
 		} else if tcpConn, ok := conn.(*net.TCPConn); ok {
-			// Fallback if you ever switch to TCP
 			tcpConn.CloseWrite()
 		}
 	}()
 
-	// 2. Receiver Routine (Main Thread)
-	dec := gob.NewDecoder(conn)
+	// 2. Receiver Routine
+	processIncomingPackets(conn)
+}
+
+func sendCommand(conn net.Conn, cmd string) error {
+	_, err := fmt.Fprintf(conn, "%s\n", cmd)
+	if err != nil {
+		return err
+	}
+	processIncomingPackets(conn)
+	return nil
+}
+
+// processIncomingPackets: The unified binary decoder loop
+func processIncomingPackets(conn io.Reader) {
+	header := make([]byte, 5) // [Type:1][Len:4]
+
 	for {
-		var pkt OutputPacket
-		if err := dec.Decode(&pkt); err != nil {
+		// 1. Read Header
+		_, err := io.ReadFull(conn, header)
+		if err != nil {
 			if err == io.EOF {
-				// Success! Master finished all jobs and closed connection.
-				break
+				break // Master closed connection
 			}
-			log.Printf("Protocol error: %v", err)
+			log.Printf("Protocol error (reading header): %v", err)
 			break
 		}
 
-		if pkt.IsExit {
-			if pkt.ExitCode != 0 {
-				fmt.Fprintf(os.Stderr, "[Remote Exit %d]\n", pkt.ExitCode)
+		pType := header[0]
+		pLen := binary.BigEndian.Uint32(header[1:])
+
+		// 2. Read Payload
+		payload := make([]byte, pLen)
+		if pLen > 0 {
+			_, err := io.ReadFull(conn, payload)
+			if err != nil {
+				log.Printf("Protocol error (reading payload): %v", err)
+				break
 			}
-			continue
 		}
 
-		if pkt.IsStderr {
-			os.Stderr.Write(pkt.Data)
-		} else {
-			os.Stdout.Write(pkt.Data)
+		// 3. Handle Data
+		switch pType {
+		case TypeStdout:
+			os.Stdout.Write(payload)
+		case TypeStderr:
+			os.Stderr.Write(payload)
+		case TypeExit:
+			exitCode := int(binary.BigEndian.Uint32(payload))
+
+			// --- FIX START ---
+			// 1. If we are in SINGLE command mode, we must exit NOW,
+			//    regardless of whether success (0) or failure (1+).
+			if !*batchMode {
+				os.Exit(exitCode)
+			}
+
+			// 2. If we are in BATCH mode, we just log errors and keep listening
+			if exitCode != 0 {
+				fmt.Fprintf(os.Stderr, "[Remote Exit %d]\n", exitCode)
+			}
+			// --- FIX END ---
 		}
 	}
 }
 
-// Refactored helper to clean up main()
 func connectToMaster(socketPath, linkName string) (net.Conn, error) {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
@@ -199,50 +249,17 @@ func connectToMaster(socketPath, linkName string) (net.Conn, error) {
 	return conn, nil
 }
 
-func sendCommand(conn net.Conn, cmd string) error {
-	// Same logic as before, just extracted
-	_, err := fmt.Fprintf(conn, "%s\n", cmd)
-	if err != nil {
-		return err
-	}
-
-	dec := gob.NewDecoder(conn)
-	for {
-		var pkt OutputPacket
-		if err := dec.Decode(&pkt); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		if pkt.IsExit {
-			os.Exit(pkt.ExitCode)
-		}
-		if pkt.IsStderr {
-			os.Stderr.Write(pkt.Data)
-		} else {
-			os.Stdout.Write(pkt.Data)
-		}
-	}
-	return nil
-}
-
-// -----------------------------------------------------------------------------
-// MASTER LOGIC
-// -----------------------------------------------------------------------------
+// --- MASTER LOGIC ---
 
 func runMaster(host string, socketPath string, homeDir string) {
-	// Redirect logs to Stderr (captured in log file)
 	log.SetOutput(os.Stderr)
-	log.Printf("Daemon starting for host: %s", host)
+	log.Printf("Daemon starting for host: %s (Optimized Binary Protocol)", host)
 
-	// 1. Create Socket Directory
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0700); err != nil {
 		log.Fatalf("Daemon failed to create socket dir: %v", err)
 	}
 
-	// 2. Setup SSH Connection
 	currentUser := os.Getenv("USER")
 	client, err := createSSHClient(host, homeDir, currentUser)
 	if err != nil {
@@ -251,7 +268,6 @@ func runMaster(host string, socketPath string, homeDir string) {
 	defer client.Close()
 	log.Println("SSH Connection Established.")
 
-	// 3. Listen on Unix Socket
 	os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -260,63 +276,40 @@ func runMaster(host string, socketPath string, homeDir string) {
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
-	// 4. Smart Accept Loop
-	// We use an atomic counter to track how many clients are currently connected.
 	var activeConnections int32
 
 	for {
-		// Set the "Alarm" for 5 minutes from NOW
 		listener.(*net.UnixListener).SetDeadline(time.Now().Add(IdleTimeout))
-
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if the error is strictly a Timeout
 			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-
-				// TIMEOUT HANDLER:
-				// If we have active connections, we are NOT idle. We snooze.
 				if atomic.LoadInt32(&activeConnections) > 0 {
-					// Log kept minimal to avoid flooding logs on long jobs
 					continue
 				}
-
-				// If count is 0, we have been truly idle for 5 minutes.
-				log.Println("Idle timeout reached (0 active connections). Shutting down.")
+				log.Println("Idle timeout reached. Shutting down.")
 				return
 			}
-
-			// If it's a real error (socket died), we must exit
 			log.Printf("Accept error: %v", err)
 			return
 		}
 
-		// Connection Accepted: Increment Counter
 		atomic.AddInt32(&activeConnections, 1)
-
 		go func() {
-			// Ensure we Decrement Counter when this client finishes
 			defer atomic.AddInt32(&activeConnections, -1)
 			handleRequest(conn, client)
 		}()
 	}
 }
 
-// -----------------------------------------------------------------------------
-// MASTER LOGIC UPDATES
-// -----------------------------------------------------------------------------
-// -----------------------------------------------------------------------------
-// ROBUST MASTER LOGIC (With Timeouts & Dynamic Limits)
-// -----------------------------------------------------------------------------
-
 func handleRequest(conn net.Conn, client *ssh.Client) {
 	defer conn.Close()
 
+	// Initialize the custom binary encoder
 	safeEnc := &SafeEncoder{
-		enc: gob.NewEncoder(conn),
+		writer: conn, // Write directly to the socket
 	}
 	reader := bufio.NewReader(conn)
 
-	// High concurrency for speed
 	maxConcurrency := 50
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
@@ -337,32 +330,31 @@ func handleRequest(conn net.Conn, client *ssh.Client) {
 		go func(cmd string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			// OPTIMIZATION: Removed context creation overhead
 			runRemoteCommand(client, cmd, safeEnc)
 		}(cmdStr)
 	}
-
 	wg.Wait()
 }
 
 func runRemoteCommand(client *ssh.Client, cmdStr string, safeEnc *SafeEncoder) {
-	// Optimization: Skip Context/Select overhead if raw speed is priority
 	session, err := client.NewSession()
 	if err != nil {
-		// If we hit the limit, just return quickly
+		// --- FIX: Report internal error to client so it doesn't hang ---
+		errMsg := fmt.Sprintf("Daemon error: failed to create SSH session: %v\n", err)
+		safeEnc.Encode(OutputPacket{IsStderr: true, Data: []byte(errMsg)})
+		safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: 255})
 		return
 	}
 
-	// Optimization: Combine Output (CombinedOutput is faster than streaming 2 pipes)
 	output, err := session.CombinedOutput(cmdStr)
-	session.Close() // Close immediately
+	session.Close()
 
-	// Send result in one big packet (Less syscalls)
+	// Send Data (Type 0 or 1)
 	if len(output) > 0 {
 		safeEnc.Encode(OutputPacket{IsStderr: false, Data: output})
 	}
 
+	// Send Exit Code (Type 3)
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*ssh.ExitError); ok {
@@ -374,12 +366,9 @@ func runRemoteCommand(client *ssh.Client, cmdStr string, safeEnc *SafeEncoder) {
 	safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: exitCode})
 }
 
-// -----------------------------------------------------------------------------
-// HELPERS
-// -----------------------------------------------------------------------------
+// --- HELPERS (Unchanged mostly) ---
 
 func getSocketPath(homeDir, linkName string) string {
-	// Generates: /home/user/.ssh/sockets/mcpi.sock
 	return filepath.Join(homeDir, SocketDir, fmt.Sprintf("%s.sock", linkName))
 }
 
@@ -391,29 +380,19 @@ func startMasterProcess(identity string) error {
 
 	homeDir, _ := os.UserHomeDir()
 	socketDir := filepath.Join(homeDir, SocketDir)
-
-	// Ensure dir exists
 	if err := os.MkdirAll(socketDir, 0700); err != nil {
 		return fmt.Errorf("failed to create socket dir: %v", err)
 	}
 
-	// Setup Log
 	logPath := filepath.Join(socketDir, identity+".log")
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create daemon log: %v", err)
 	}
 
-	// Spawn Daemon
 	cmd := exec.Command(selfExe, "--daemon", identity)
-
-	// CRITICAL FIX: Pass current environment (SSH_AUTH_SOCK) to the daemon
 	cmd.Env = os.Environ()
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Detach
-	}
-
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -422,47 +401,29 @@ func startMasterProcess(identity string) error {
 		logFile.Close()
 		return err
 	}
-
 	logFile.Close()
 	return nil
 }
 
-// func sendPacket(w io.Writer, pkt OutputPacket) {
-// 	// In a high-throughput scenario, cache the encoder or use a buffered writer
-// 	gob.NewEncoder(w).Encode(pkt)
-// }
-
-// func sendError(w io.Writer, msg string) {
-// 	sendPacket(w, OutputPacket{IsStderr: true, Data: []byte(msg + "\n")})
-// 	sendPacket(w, OutputPacket{IsExit: true, ExitCode: 1})
-// }
-
 func createSSHClient(host string, home string, user string) (*ssh.Client, error) {
-	// 1. Host Key Verification (Strict)
 	khPath := filepath.Join(home, ".ssh", "known_hosts")
 	hkCallback, err := knownhosts.New(khPath)
 	if err != nil {
-		log.Printf("Warning: known_hosts not found or invalid, using insecure fallback for: %s", host)
+		log.Printf("Warning: known_hosts not found, using insecure fallback")
 		hkCallback = ssh.InsecureIgnoreHostKey()
 	}
 
 	var auths []ssh.AuthMethod
-
-	// 2. Method A: SSH Agent
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
 			agentClient := agent.NewClient(conn)
-			// Check if agent actually has keys
 			if signers, _ := agentClient.Signers(); len(signers) > 0 {
 				auths = append(auths, ssh.PublicKeysCallback(agentClient.Signers))
-				log.Println("Added SSH Agent to auth methods")
 			}
 		}
 	}
 
-	// 3. Method B: Private Key Files (Fallback)
-	keyFiles := []string{"id_ed25519", "id_rsa"} // Check both common types
-
+	keyFiles := []string{"id_ed25519", "id_rsa"}
 	for _, name := range keyFiles {
 		keyPath := filepath.Join(home, ".ssh", name)
 		keyBytes, err := os.ReadFile(keyPath)
@@ -470,13 +431,12 @@ func createSSHClient(host string, home string, user string) (*ssh.Client, error)
 			signer, err := ssh.ParsePrivateKey(keyBytes)
 			if err == nil {
 				auths = append(auths, ssh.PublicKeys(signer))
-				log.Printf("Added key file %s to auth methods", name)
 			}
 		}
 	}
 
 	if len(auths) == 0 {
-		return nil, fmt.Errorf("no auth methods found (checked Agent, id_ed25519, id_rsa)")
+		return nil, fmt.Errorf("no auth methods found")
 	}
 
 	config := &ssh.ClientConfig{
@@ -491,16 +451,11 @@ func createSSHClient(host string, home string, user string) (*ssh.Client, error)
 }
 
 func resolveHost(linkName string) string {
-	// 1. Map specific symlinks to specific hostnames
 	if strings.Contains(linkName, "mcpi") {
 		return "mcpi"
 	}
 	if strings.Contains(linkName, "ftb") {
 		return "ftb"
 	}
-
-	// 2. Dynamic Fallback:
-	// If the link name is a valid hostname (like "localhost"), use it directly.
-	// You might want to add a validation regex here in production.
 	return linkName
 }
