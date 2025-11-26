@@ -1,4 +1,4 @@
-module github.com/sys_remote_openssh
+module github.com/sys_remote
 
 go 1.25.4
 

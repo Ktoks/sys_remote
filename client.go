@@ -32,15 +32,50 @@ func connectToMaster(socketPath, linkName string) (net.Conn, error) {
 }
 
 func startMasterProcess(identity string) error {
-	selfExe, err := os.Executable()
+	homeDir, _ := os.UserHomeDir()
+	socketDir := filepath.Join(homeDir, SocketDir)
+
+	// ensure the directory exists
+	if err := os.MkdirAll(socketDir, 0700); err != nil {
+		return fmt.Errorf("failed to create socket dir: %v", err)
+	}
+
+	lockPath := filepath.Join(socketDir, identity+".lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 
-	homeDir, _ := os.UserHomeDir()
-	socketDir := filepath.Join(homeDir, SocketDir)
-	if err := os.MkdirAll(socketDir, 0700); err != nil {
-		return fmt.Errorf("failed to create socket dir: %v", err)
+	defer func() {
+		err = lockFile.Close()
+		if err != nil {
+			fmt.Println("listener close error: ", err)
+		}
+	}()
+
+	// Try to acquire an exclusive lock
+	// If another client is holding this, wait until they finish spawning
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() {
+		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		if err != nil {
+			fmt.Println("error getting lock: ", err)
+		}
+	}()
+
+	// DOUBLE CHECK: After acquiring lock, check if socket exists now.
+	// Maybe the previous lock-holder already started the daemon.
+	socketPath := getSocketPath(homeDir, identity)
+	if _, err := os.Stat(socketPath); err == nil {
+		// socket exists now, no need to spawn
+		return nil
+	}
+
+	selfExe, err := os.Executable()
+	if err != nil {
+		return err
 	}
 
 	logPath := filepath.Join(socketDir, identity+".log")
