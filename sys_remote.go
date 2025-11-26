@@ -51,7 +51,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() {
+		err = conn.Close()
+		if err != nil {
+			log.Println("main: connection close error: ", err)
+		}
+	}()
 
 	// 2A. Run batch mode
 	if *batchMode {

@@ -1,8 +1,9 @@
 package main
 
 import (
-	"encoding/binary"
 	"bufio"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -33,46 +34,80 @@ type OutputPacket struct {
 	Data     []byte
 }
 
-
 func startMaster(host string, socketPath string, homeDir string) {
 	log.SetOutput(os.Stderr)
-	log.Printf("Daemon starting for host: %s (Optimized Binary Protocol)", host)
+	log.Printf("*** %s *** daemon starting", host)
 
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0700); err != nil {
-		log.Fatalf("Daemon failed to create socket dir: %v", err)
+		log.Fatalf("daemon failed to create socket dir: %v", err)
 	}
 
 	currentUser := os.Getenv("USER")
 	client, err := createSSHClient(host, homeDir, currentUser)
 	if err != nil {
-		log.Fatalf("SSH Handshake Failed: %v", err)
+		log.Fatalf("ssh handshake hailed: %v", err)
 	}
-	defer client.Close()
-	log.Println("SSH Connection Established.")
 
-	os.Remove(socketPath)
+	defer func() {
+		err = client.Close()
+		if err != nil {
+			log.Println("connection close error: ", err)
+		}
+	}()
+	log.Printf("%s connection established.", host)
+
+	// check, then clean up old socket
+	_, err = os.Stat(socketPath)
+
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Fatal("filesystem error: ", err)
+		}
+	} else {
+		log.Println("old socket found, removing...")
+		removeErr := os.Remove(socketPath)
+		if removeErr != nil {
+			log.Fatal("cannot remove socket: ", removeErr)
+		}
+	}
+
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		log.Fatalf("Daemon failed to listen on socket: %v", err)
+		log.Fatalf("daemon failed to listen on socket: %v", err)
 	}
-	defer listener.Close()
-	defer os.Remove(socketPath)
+
+	defer func() {
+		err = listener.Close()
+		if err != nil {
+			log.Println("listener close error: ", err)
+		}
+	}()
+
+	defer func() {
+		err = os.Remove(socketPath)
+		if err != nil {
+			log.Println("socket cleanup error: ", err)
+		}
+	}()
 
 	var activeConnections int32
 
 	for {
-		listener.(*net.UnixListener).SetDeadline(time.Now().Add(IdleTimeout))
+		setDeadlineErr := listener.(*net.UnixListener).SetDeadline(time.Now().Add(IdleTimeout))
+		if setDeadlineErr != nil {
+			log.Println("setting deadline failed: ", err)
+		}
 		connection, err := listener.Accept()
 		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
 				if atomic.LoadInt32(&activeConnections) > 0 {
 					continue
 				}
-				log.Println("Idle timeout reached. Shutting down.")
+				log.Println("idle timeout reached - shutting down")
 				return
 			}
-			log.Printf("Accept error: %v", err)
+			log.Printf("listener accept error: %v", err)
 			return
 		}
 
@@ -85,7 +120,13 @@ func startMaster(host string, socketPath string, homeDir string) {
 }
 
 func handleRequest(connection net.Conn, client *ssh.Client) {
-	defer connection.Close()
+	err := errors.New("")
+	defer func() {
+		err = connection.Close()
+		if err != nil {
+			log.Println("handleRequest: connection close error: ", err)
+		}
+	}()
 
 	// Initialize the custom binary encoder
 	safeEncoder := &SafeEncoder{
@@ -107,12 +148,11 @@ func handleRequest(connection net.Conn, client *ssh.Client) {
 			continue
 		}
 
-
 		semaphore <- struct{}{}
 		waitGroup.Add(1)
 
 		go func(command string) {
-	
+
 			defer waitGroup.Done()
 			defer func() { <-semaphore }()
 			runRemoteCommand(client, command, safeEncoder)
@@ -124,19 +164,35 @@ func handleRequest(connection net.Conn, client *ssh.Client) {
 func runRemoteCommand(client *ssh.Client, commandString string, safeEncoder *SafeEncoder) {
 	session, err := client.NewSession()
 	if err != nil {
-		// --- FIX: Report internal error to client so it doesn't hang ---
-		errMsg := fmt.Sprintf("Daemon error: failed to create SSH session: %v\n", err)
-		safeEncoder.Encode(OutputPacket{IsStderr: true, Data: []byte(errMsg)})
-		safeEncoder.Encode(OutputPacket{IsExit: true, ExitCode: 255})
+		errMsg := fmt.Sprintf("daemon error: failed to create SSH session: %v\n", err)
+		err := safeEncoder.Encode(OutputPacket{IsStderr: true, Data: []byte(errMsg)})
+		if err != nil {
+			log.Println("encoding STDERR failed: ", err)
+		}
+		err = safeEncoder.Encode(OutputPacket{IsExit: true, ExitCode: 255})
+		if err != nil {
+			log.Println("encoding IsExit failed: ", err)
+		}
 		return
 	}
 
 	output, err := session.CombinedOutput(commandString)
-	session.Close()
+
+	closeErr := session.Close()
+	if closeErr != nil {
+		if closeErr == io.EOF {
+			log.Println("completed processing: ", commandString)
+		} else {
+			log.Println("session error (closing): ", closeErr)
+		}
+	}
 
 	// Send Data (Type 0 or 1)
 	if len(output) > 0 {
-		safeEncoder.Encode(OutputPacket{IsStderr: false, Data: output})
+		err := safeEncoder.Encode(OutputPacket{IsStderr: false, Data: output})
+		if err != nil {
+			log.Println("encoding IsStderr failed: ", err)
+		}
 	}
 
 	// Send Exit Code (Type 3)
@@ -148,14 +204,17 @@ func runRemoteCommand(client *ssh.Client, commandString string, safeEncoder *Saf
 			exitCode = 1
 		}
 	}
-	safeEncoder.Encode(OutputPacket{IsExit: true, ExitCode: exitCode})
+	err = safeEncoder.Encode(OutputPacket{IsExit: true, ExitCode: exitCode})
+	if err != nil {
+		log.Println("encoding IsExit failed: ", err)
+	}
 }
 
 func createSSHClient(host string, home string, user string) (*ssh.Client, error) {
 	knownHostPath := filepath.Join(home, ".ssh", "known_hosts")
 	hostKeyCallback, err := knownhosts.New(knownHostPath)
 	if err != nil {
-		log.Printf("Warning: known_hosts not found, using insecure fallback")
+		log.Printf("warning: known_hosts not found, using insecure fallback")
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
@@ -206,7 +265,7 @@ func processIncomingPackets(connection io.Reader) {
 			if err == io.EOF {
 				break // Master closed connection
 			}
-			log.Printf("Protocol error (reading header): %v", err)
+			log.Printf("protocol error (reading header): %v", err)
 			break
 		}
 
@@ -218,7 +277,7 @@ func processIncomingPackets(connection io.Reader) {
 		if payloadLength > 0 {
 			_, err := io.ReadFull(connection, payload)
 			if err != nil {
-				log.Printf("Protocol error (reading payload): %v", err)
+				log.Printf("protocol error (reading payload): %v", err)
 				break
 			}
 		}
@@ -227,10 +286,16 @@ func processIncomingPackets(connection io.Reader) {
 		switch payloadType {
 
 		case TypeStdout:
-			os.Stdout.Write(payload)
+			number, err := os.Stdout.Write(payload)
+			if err != nil {
+				log.Printf("Stdout write error: %v, %v", err, number)
+			}
 
 		case TypeStderr:
-			os.Stderr.Write(payload)
+			number, err := os.Stderr.Write(payload)
+			if err != nil {
+				log.Printf("Stderr write error: %v, %v", err, number)
+			}
 
 		case TypeExit:
 			exitCode := int(binary.BigEndian.Uint32(payload))

@@ -18,7 +18,7 @@ func connectToMaster(socketPath, linkName string) (net.Conn, error) {
 		if err := startMasterProcess(linkName); err != nil {
 			return nil, fmt.Errorf("failed to spawn master: %v", err)
 		}
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			time.Sleep(200 * time.Millisecond)
 			connection, err = net.Dial("unix", socketPath)
 			if err == nil {
@@ -57,10 +57,16 @@ func startMasterProcess(identity string) error {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
+		log_err := logFile.Close()
+		if log_err != nil {
+			fmt.Println("log file close error: ", log_err)
+		}
 		return err
 	}
-	logFile.Close()
+	log_err := logFile.Close()
+	if log_err != nil {
+		fmt.Println("log file close error: ", log_err)
+	}
 	return nil
 }
 
@@ -81,9 +87,15 @@ func runBatchMode(connection net.Conn) {
 		}
 		// Close write end to signal EOF
 		if unixConn, ok := connection.(*net.UnixConn); ok {
-			unixConn.CloseWrite()
+			err := unixConn.CloseWrite()
+			if err != nil {
+				fmt.Println("connection error: ", err)
+			}
 		} else if tcpConn, ok := connection.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
+			err := tcpConn.CloseWrite()
+			if err != nil {
+				fmt.Println("connection error: ", err)
+			}
 		}
 	}()
 
