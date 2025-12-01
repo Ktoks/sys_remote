@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
+	"syscall" // Required for os/exec.Cmd.SysProcAttr struct definition
 	"time"
+
+	"golang.org/x/sys/unix" // Replaces syscall for actual logic (locking)
 )
 
 func connectToMaster(socketPath, linkName string) (net.Conn, error) {
@@ -53,20 +55,20 @@ func startMasterProcess(identity string) error {
 		}
 	}()
 
+	// UPDATED: Use unix package for locking
 	// Try to acquire an exclusive lock
-	// If another client is holding this, wait until they finish spawning
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
 		return err
 	}
 	defer func() {
-		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		// UPDATED: Use unix package for unlocking
+		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
 		if err != nil {
 			fmt.Println("error getting lock: ", err)
 		}
 	}()
 
-	// DOUBLE CHECK: After acquiring lock, check if socket exists now.
-	// Maybe the previous lock-holder already started the daemon.
+	// CHECK: After acquiring lock, check if socket exists now.
 	socketPath := getSocketPath(homeDir, identity)
 	if _, err := os.Stat(socketPath); err == nil {
 		// socket exists now, no need to spawn
@@ -86,7 +88,11 @@ func startMasterProcess(identity string) error {
 
 	cmd := exec.Command(selfExe, "--daemon", identity)
 	cmd.Env = os.Environ()
+
+	// Note: We must still use syscall.SysProcAttr here because
+	// os/exec expects this specific struct type.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
